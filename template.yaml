@@ -1,0 +1,223 @@
+Description: CloudFormation template that will deploy a new Helium miner in a ‘t4g’ EC2 instance (uses ARM CPU like RPi), setup logging in AWS CloudWatch Logs and rotate logs locally, create a block height metric in CloudWatch Metrics and backup the private swarm key in Amazon S3 with encryption enabled.
+Parameters:
+  IpAddressSSH:
+    Description: Allow SSH (TCP 22) access from IP.
+    Type: String
+    Default: 0.0.0.0/0
+  IpAddressLoRaWAN:
+    Description: Allow LoRa Packet Forwarder (UDP 1680) access from IP.
+    Type: String
+    Default: 0.0.0.0/0
+  InstanceTypeParameter: 
+    Description: Enter the instance type.
+    Type: String
+    Default: t4g.nano
+    AllowedValues: 
+      - t4g.nano
+      - t4g.micro
+      - t4g.medium
+  KeyName:
+    Description: The EC2 Key Pair to allow SSH access to the instance
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Default: helium
+Resources:
+  IAMRoleForEC2:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - 
+          PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 'logs:*'
+                Resource: '*' 
+              - Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: !GetAtt [S3Bucket,Arn] 
+              - Effect: Allow
+                Action: 's3:PutObject'
+                Resource: !Join 
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref S3Bucket
+                    - /*
+              - Effect: Allow
+                Action: 'cloudwatch:PutMetricData'
+                Resource: '*'
+  S3BucketFullInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles: 
+        - !Ref IAMRoleForEC2
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+         Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Delete
+  EIPAddress:
+    Type: AWS::EC2::EIP
+    Properties: 
+      InstanceId: !Ref EC2Instance
+  EC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      Tags:
+      -
+        Key: Name
+        Value: MyAWSHeliumMiner
+      SecurityGroups:
+      - !Ref InstanceSecurityGroup
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref S3BucketFullInstanceProfile
+      InstanceType: !Ref InstanceTypeParameter
+      ImageId: ami-036559f6f83de21be
+      UserData:
+        Fn::Base64: 
+          Fn::Sub:
+          - 
+            |
+            #!/bin/bash -xe
+            # Enable Swap
+            dd if=/dev/zero of=/swapfile bs=128M count=8
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            swapon -s
+            echo '/swapfile swap swap defaults 0 0' | tee -a /etc/fstab > /dev/nul
+            
+            # Get Docker
+            yum install docker amazon-cloudwatch-agent -y
+            systemctl start docker
+            systemctl enable docker
+            usermod -a -G docker ec2-user
+            
+            # Install the miner
+            mkdir /home/ec2-user/miner_data && mkdir /home/ec2-user/miner_logs
+            docker run -d --restart always --env REGION_OVERRIDE=EU868 --publish 1680:1680/udp --publish 44158:44158/tcp --name miner --mount type=bind,source=/home/ec2-user/miner_data,target=/var/data --mount type=bind,source=/home/ec2-user/miner_logs,target=/var/log/miner quay.io/team-helium/miner:latest-arm64
+            
+            # Create backup script and run it
+            cat <<EOL > /home/ec2-user/backup_swarm_key.sh 
+            #!/bin/bash -x
+            while true; do
+              aws s3 ls s3://${S3Bucket}/swarm_key
+              if [ \$? -eq 0 ]; then
+                echo "Swarm key found, exiting..."
+                break
+              fi
+              echo "Swarm key not found, copying file..."
+              sleep 5
+              aws s3 cp /home/ec2-user/miner_data/miner/swarm_key s3://${S3Bucket}/swarm_key
+            done
+            EOL
+            chmod +x /home/ec2-user/backup_swarm_key.sh
+            /home/ec2-user/backup_swarm_key.sh &> /home/ec2-user/backup_swarm_key.log 2>&1 &
+            
+            # Create block height metric script and intall the crontab
+            cat <<EOL > /home/ec2-user/check_height_delta.sh
+            #!/bin/bash -x         
+            miner_height=\$(docker exec miner miner info height | awk '{print \$2}')
+            miner_name=\$(docker exec miner miner info name)
+            network_height=\$(echo \$(echo \$(curl https://api.helium.io/v1/blocks/height) | rev | cut -d":" -f1 | rev) | rev |cut -b 3- | rev)
+            miner_height_delta=\$((\$network_height-\$miner_height))
+            aws cloudwatch put-metric-data --metric-name BlockHeightDelta --namespace Helium --unit Count --value \$(echo \$miner_height_delta) --dimensions Miner=\$(echo \$miner_name) --region eu-west-1
+            EOL
+            chmod +x /home/ec2-user/check_height_delta.sh
+            crontab<<EOF
+            */5 * * * * /home/ec2-user/check_height_delta.sh &> /home/ec2-user/check_height_delta.log 2>&1 &
+            EOF
+
+            ## Configure logrotate 
+            cat <<EOL > /etc/logrotate.d/helium
+            /home/ec2-user/miner_logs/*log {
+              daily
+              rotate 30
+              compress
+            }
+            EOL
+            ## Configure log shipping to AWS CloudWatch Logs
+            cat <<EOL > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            {
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      { 
+                        "log_group_name": "HELIUM_MINER",
+                        "file_path": "/home/ec2-user/miner_logs/error.log",
+                        "log_stream_name": "{instance_id}/home/ec2-user/miner_logs/error.log"
+                      },
+                      { 
+                        "log_group_name": "HELIUM_MINER",
+                        "file_path": "/home/ec2-user/miner_logs/console.log",
+                        "log_stream_name": "{instance_id}/home/ec2-user/miner_logs/console.log"
+                      },
+                      { 
+                        "log_group_name": "HELIUM_MINER",
+                        "file_path": "/home/ec2-user/miner_logs/crash.log",
+                        "log_stream_name": "{instance_id}/home/ec2-user/miner_logs/crash.log"
+                      },
+                      { 
+                        "log_group_name": "HELIUM_MINER",
+                        "file_path": "/home/ec2-user/backup_swarm_key.log",
+                        "log_stream_name": "{instance_id}/home/ec2-user/backup_swarm_key.log"
+                      },
+                      { 
+                        "log_group_name": "HELIUM_MINER",
+                        "file_path": "/home/ec2-user/check_height_delta.log",
+                        "log_stream_name": "{instance_id}/home/ec2-user/check_height_delta.log"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            EOL
+            systemctl start amazon-cloudwatch-agent
+            systemctl enable amazon-cloudwatch-agent
+          - S3Bucket : !Ref S3Bucket
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable SSH, LoraWAN UDP and Helium miner communication
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: !Sub '${IpAddressSSH}'
+      - IpProtocol: udp
+        FromPort: '1680'
+        ToPort: '1680'
+        CidrIp: !Sub '${IpAddressLoRaWAN}'
+      - IpProtocol: tcp
+        FromPort: '44158'
+        ToPort: '44158'
+        CidrIp: 0.0.0.0/0
+Outputs:
+  MinerIPAddress:
+    Description: The miner IP address
+    Value: !Ref EIPAddress
+  S3Bucket:
+    Description: The miner S3 bucket used to store the private key
+    Value: !Ref S3Bucket
